@@ -38,6 +38,14 @@ pub struct Gpu {
     pub mesh: bool,
     pub wave_min: u32,
     pub wave_max: u32,
+    pub uma: bool,
+}
+
+/// Memory information for preflight diagnostics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryInfo {
+    pub total_phys_mb: usize,
+    pub avail_commit_mb: usize,
 }
 
 /// Everything the checks look at; `checks` turns it into the list.
@@ -48,6 +56,7 @@ pub struct Found {
     pub dxc_toolchain: crate::gpu::recomp::dxc::Toolchain,
     pub xgameruntime: bool,
     pub gpu: Result<Gpu, String>,
+    pub memory: MemoryInfo,
 }
 
 fn check(level: Level, what: impl Into<String>, fix: Option<&str>) -> Check {
@@ -92,6 +101,22 @@ pub fn checks(f: &Found) -> Vec<Check> {
     }
     if !f.xgameruntime {
         v.push(check(Level::Warning, "no System32\\xgameruntime.dll: dialogs, text entry, game invites and game streaming are missing (XCL's own task queues, async and networking are used)", Some("install Gaming Services (Microsoft Store)")));
+    }
+    if f.memory.total_phys_mb > 0 {
+        let phys_gb = f.memory.total_phys_mb.div_ceil(1024);
+        let commit_gb = f.memory.avail_commit_mb.div_ceil(1024);
+        let is_uma = f.gpu.as_ref().map_or(false, |g| g.uma);
+        if f.memory.total_phys_mb <= 18 * 1024 {
+            let note = format!("Memory: {phys_gb} GB RAM, {commit_gb} GB commit free (handheld / constrained memory)");
+            let fix = if is_uma {
+                Some("recommend XCL_PROFILE=handheld or Series S (lockhart) for 16-24 GB APUs")
+            } else {
+                Some("large retail titles may require a larger Windows page file")
+            };
+            v.push(check(Level::Note, note, fix));
+        } else {
+            v.push(check(Level::Ok, format!("Memory: {phys_gb} GB RAM, {commit_gb} GB commit free"), None));
+        }
     }
     v
 }
@@ -143,14 +168,31 @@ fn probe_gpu(setting: &str) -> Result<Gpu, String> {
         let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
         let mesh = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32).is_ok()
             && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
+        let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+        let uma = dev.CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &mut arch as *mut _ as _, std::mem::size_of_val(&arch) as u32).is_ok()
+            && (arch.UMA.as_bool() || arch.CacheCoherentUMA.as_bool());
         let no_sm66 = crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state());
-        Ok(Gpu { name, warp, shader_model, no_sm66, mesh, wave_min: o1.WaveLaneCountMin, wave_max: o1.WaveLaneCountMax })
+        Ok(Gpu { name, warp, shader_model, no_sm66, mesh, wave_min: o1.WaveLaneCountMin, wave_max: o1.WaveLaneCountMax, uma })
     }
 }
 
 fn xgameruntime_present() -> bool {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     std::path::Path::new(&root).join("System32").join("xgameruntime.dll").is_file()
+}
+
+fn query_memory() -> MemoryInfo {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+        MemoryInfo {
+            total_phys_mb: (m.ullTotalPhys >> 20) as usize,
+            avail_commit_mb: (m.ullAvailPageFile >> 20) as usize,
+        }
+    } else {
+        MemoryInfo::default()
+    }
 }
 
 /// Check this PC for a run with the adapter `setting`.
@@ -160,6 +202,7 @@ pub fn run(setting: &str) -> Vec<Check> {
         dxc_toolchain: crate::gpu::recomp::dxc::toolchain(),
         xgameruntime: xgameruntime_present(),
         gpu: probe_gpu(setting),
+        memory: query_memory(),
     };
     checks(&found)
 }
@@ -186,11 +229,11 @@ mod tests {
     use super::*;
 
     fn gpu() -> Gpu {
-        Gpu { name: "Radeon RX 9070 (16304 MiB VRAM)".into(), warp: false, shader_model: (6, 6), no_sm66: "x: no SM 6.6".into(), mesh: true, wave_min: 32, wave_max: 64 }
+        Gpu { name: "Radeon RX 9070 (16304 MiB VRAM)".into(), warp: false, shader_model: (6, 6), no_sm66: "x: no SM 6.6".into(), mesh: true, wave_min: 32, wave_max: 64, uma: false }
     }
 
     fn found(gpu: Gpu) -> Found {
-        Found { dxc: Ok(r"C:\dxc".into()), dxc_toolchain: dxc(1, 9), xgameruntime: true, gpu: Ok(gpu) }
+        Found { dxc: Ok(r"C:\dxc".into()), dxc_toolchain: dxc(1, 9), xgameruntime: true, gpu: Ok(gpu), memory: MemoryInfo::default() }
     }
 
     fn dxc(major: u32, minor: u32) -> crate::gpu::recomp::dxc::Toolchain {
@@ -205,6 +248,19 @@ mod tests {
     #[test]
     fn a_complete_pc_has_nothing_to_report() {
         assert_eq!(levels(&found(gpu())), [Level::Ok, Level::Ok]);
+    }
+
+    #[test]
+    fn constrained_memory_reports_handheld_recommendation() {
+        let f = Found {
+            memory: MemoryInfo { total_phys_mb: 16 * 1024, avail_commit_mb: 12 * 1024 },
+            gpu: Ok(Gpu { uma: true, ..gpu() }),
+            ..found(gpu())
+        };
+        let c = checks(&f);
+        let mem_check = c.iter().find(|x| x.what.contains("Memory:")).expect("memory check");
+        assert_eq!(mem_check.level, Level::Note);
+        assert!(mem_check.fix.as_deref().unwrap().contains("XCL_PROFILE=handheld"));
     }
 
     #[test]

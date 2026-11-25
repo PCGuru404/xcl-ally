@@ -793,11 +793,12 @@ pub fn coherent_hint_for(windows: usize) -> usize {
     // and textures (WDDM charges commit for each video-memory allocation too) and the window
     // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
     // unified memory: no image) rather than taking the system's commit
-    if title > 0 && free_commit() < NEEDS_FOR_COHERENT_HEAPS {
+    let threshold = coherent_commit_threshold(title);
+    if title > 0 && free_commit() < threshold {
         crate::xlog_warn!(
             "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
             free_commit() >> 20,
-            NEEDS_FOR_COHERENT_HEAPS >> 20
+            threshold >> 20
         );
         return RUNTIME_COMMITTED_CAP;
     }
@@ -810,7 +811,21 @@ pub fn coherent_hint() -> usize {
 }
 
 /// Commit free before the title starts for its GPU heaps to go to the coherent window.
-const NEEDS_FOR_COHERENT_HEAPS: usize = 17 << 30;
+pub const NEEDS_FOR_COHERENT_HEAPS: usize = 17 << 30;
+
+/// Dynamically determine the commit headroom required before admitting title GPU heaps into
+/// the coherent window, adapting to Lockhart / handheld memory budgets (e.g. 16 GB RAM Ally X).
+pub fn coherent_commit_threshold(title_asked: usize) -> usize {
+    let handheld_or_series_s = crate::state::boot().map_or_else(
+        || std::env::var("XCL_PROFILE").map_or(false, |v| crate::config::matches_handheld_profile(&v)),
+        |b| b.config.is_series_s() || b.config.is_handheld_profile(),
+    );
+    if handheld_or_series_s {
+        (title_asked.saturating_add(8 << 30)).min(12 << 30)
+    } else {
+        (title_asked.saturating_add(13 << 30)).min(NEEDS_FOR_COHERENT_HEAPS)
+    }
+}
 
 fn free_commit() -> usize {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -1187,5 +1202,18 @@ mod tests {
         assert_eq!(u.window_of(a), Some(0));
         assert_eq!(u.window_of(b), Some(1));
         assert!(u.free(a) && u.free(b));
+    }
+
+    #[test]
+    fn coherent_commit_threshold_adapts_for_handheld_and_desktop() {
+        // Desktop default profile without boot record
+        assert_eq!(coherent_commit_threshold(4 << 30), 17 << 30);
+
+        // Explicit handheld profile environment variable
+        std::env::set_var("XCL_PROFILE", "handheld");
+        assert_eq!(coherent_commit_threshold(0), 8 << 30);
+        assert_eq!(coherent_commit_threshold(2 << 30), 10 << 30);
+        assert_eq!(coherent_commit_threshold(6 << 30), 12 << 30);
+        std::env::remove_var("XCL_PROFILE");
     }
 }

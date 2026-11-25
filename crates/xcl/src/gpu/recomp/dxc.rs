@@ -404,11 +404,27 @@ const WANTED_AT_ONCE: usize = 6;
 /// to be 6, which left most of a 16-thread CPU idle while a title with ~24 000 shaders
 /// compiled for half an hour. (Normal priority: a title thread can wait for a pipeline –
 /// `resolve_wait`, a compute pipeline's first bind – and must not wait behind its own threads.)
+pub fn default_compile_threads(cores: usize, handheld_or_constrained: bool) -> usize {
+    if handheld_or_constrained {
+        (cores / 2).clamp(2, 6)
+    } else {
+        cores.saturating_sub(1).clamp(1, 64)
+    }
+}
+
 pub fn compile_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+        let handheld_or_constrained = crate::state::boot().map_or_else(
+            || std::env::var("XCL_PROFILE").map_or(false, |v| crate::config::matches_handheld_profile(&v)),
+            |b| b.config.is_handheld_profile(),
+        );
+        std::env::var("XCL_DXC_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| default_compile_threads(cores, handheld_or_constrained))
+            .clamp(1, 64)
     })
 }
 
@@ -1268,5 +1284,18 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    #[test]
+    fn default_compile_threads_limits_for_handheld_cpus() {
+        // Desktop uses cores - 1 up to 64
+        assert_eq!(default_compile_threads(16, false), 15);
+        assert_eq!(default_compile_threads(8, false), 7);
+        assert_eq!(default_compile_threads(4, false), 3);
+
+        // Handheld / constrained APUs cap threads at 6 to protect game CPU & memory
+        assert_eq!(default_compile_threads(16, true), 6);
+        assert_eq!(default_compile_threads(8, true), 4);
+        assert_eq!(default_compile_threads(4, true), 2);
     }
 }

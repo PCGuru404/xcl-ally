@@ -72,6 +72,8 @@ pub struct Config {
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
     pub mouse_sensitivity: f32,
+    /// Operating profile: "auto", "desktop", or "handheld" (limits memory/threads for <=24 GB APUs).
+    pub profile: String,
 }
 
 impl Config {
@@ -187,6 +189,7 @@ impl Default for Config {
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
+            profile: "auto".into(),
         }
     }
 }
@@ -237,6 +240,20 @@ impl Config {
         self.device_type.eq_ignore_ascii_case("lockhart") || self.device_type.eq_ignore_ascii_case("series s")
     }
 
+    /// Whether this configuration uses the handheld hardware profile (explicit or via `XCL_PROFILE`).
+    pub fn is_handheld_profile(&self) -> bool {
+        let env_override = std::env::var("XCL_PROFILE").ok();
+        let mode = env_override.as_deref().unwrap_or(&self.profile);
+        matches_handheld_profile(mode)
+    }
+
+    /// Apply an operating profile override ("handheld"/"ally"/"ally-x" or "desktop").
+    pub fn apply_profile_override(&mut self, raw: &str) -> Option<&'static str> {
+        let canonical = parse_profile(raw)?;
+        self.profile = canonical.into();
+        Some(canonical)
+    }
+
     /// Normalize and apply a `XCL_DEVICE_TYPE` override ("anaconda"/"series x"/"xsx"/"x" or
     /// "lockhart"/"series s"/"xss"/"s") in memory without modifying `xcl.toml`.
     /// Returns the canonical device type name when applied.
@@ -262,6 +279,19 @@ pub fn parse_device_type(raw: &str) -> Option<&'static str> {
         "anaconda" | "series x" | "series_x" | "xsx" | "x" => Some("anaconda"),
         _ => None,
     }
+}
+
+pub fn parse_profile(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "handheld" | "ally" | "ally-x" | "ally_x" | "deck" => Some("handheld"),
+        "desktop" | "pc" => Some("desktop"),
+        "auto" | "" => Some("auto"),
+        _ => None,
+    }
+}
+
+pub fn matches_handheld_profile(raw: &str) -> bool {
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "handheld" | "ally" | "ally-x" | "ally_x" | "deck")
 }
 
 pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
@@ -405,6 +435,29 @@ mod tests {
             ("", None),
         ] {
             assert_eq!(parse_device_type(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn profile_override_and_parsing() {
+        let mut c = Config::default();
+        assert_eq!(c.profile, "auto");
+        assert!(!c.is_handheld_profile());
+
+        assert_eq!(c.apply_profile_override("ally-x"), Some("handheld"));
+        assert_eq!(c.profile, "handheld");
+        assert!(c.is_handheld_profile());
+
+        for (raw, exp) in [
+            ("handheld", Some("handheld")),
+            ("ally", Some("handheld")),
+            ("ally_x", Some("handheld")),
+            ("deck", Some("handheld")),
+            ("desktop", Some("desktop")),
+            ("auto", Some("auto")),
+            ("other", None),
+        ] {
+            assert_eq!(parse_profile(raw), exp, "{raw}");
         }
     }
 

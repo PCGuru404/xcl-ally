@@ -321,6 +321,21 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         let _ = std::fs::create_dir_all(data_dir.join(d));
     }
     config.exe = exe.strip_prefix(&root).ok().or(exe.file_name().map(Path::new)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let profile_override = if let Ok(raw) = std::env::var("XCL_PROFILE") {
+        if !raw.trim().is_empty() {
+            match config.apply_profile_override(&raw) {
+                Some(canonical) => Some(canonical),
+                None => {
+                    eprintln!("xcl: ignoring unknown XCL_PROFILE={raw:?} (expected handheld/desktop/auto)");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let device_override = if let Ok(raw) = std::env::var("XCL_DEVICE_TYPE") {
         if !raw.trim().is_empty() {
             match config.apply_device_type_override(&raw) {
@@ -333,6 +348,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         } else {
             None
         }
+    } else if config.is_handheld_profile() && config.device_type.eq_ignore_ascii_case("anaconda") {
+        // Handheld profile defaults to Lockhart (Series S) unless Anaconda is explicitly specified.
+        config.apply_device_type_override("lockhart")
     } else {
         None
     };
@@ -355,8 +373,13 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     println!("XCL {} – starting '{title}'", env!("CARGO_PKG_VERSION"));
     println!("  exe:   {}", exe.display());
     println!("  data:  {}", data_dir.display());
+    if boot.config.is_handheld_profile() {
+        println!("  profile: handheld (limits memory/threads for handheld APUs)");
+    } else if let Some(prof) = profile_override {
+        println!("  profile: {prof}");
+    }
     if let Some(dev) = device_override {
-        println!("  device: {dev} (XCL_DEVICE_TYPE, title memory {} MiB)", boot.config.title_memory_mb);
+        println!("  device: {dev} (title memory {} MiB)", boot.config.title_memory_mb);
     }
     if !from_manifest.is_empty() {
         println!("  MicrosoftGame.Config: {}", from_manifest.join(", "));
