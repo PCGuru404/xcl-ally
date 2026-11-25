@@ -4,14 +4,16 @@
 
 <p align="center">
   <a href="https://discord.gg/xcl"><img alt="Discord: join the server" src="https://img.shields.io/badge/Discord-join%20the%20server-7c5cff?style=for-the-badge"></a>
-  <a href="https://github.com/xcl-dev/xcl/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/xcl-dev/xcl/ci.yml?branch=main&style=for-the-badge&label=CI"></a>
+  <a href="https://github.com/xcl-dev/xcl"><img alt="Upstream: xcl-dev/xcl" src="https://img.shields.io/badge/upstream-xcl--dev%2Fxcl-2f80ed?style=for-the-badge"></a>
   <a href="LICENSE"><img alt="License: GPL-2.0-only" src="https://img.shields.io/badge/license-GPL--2.0--only-7c5cff?style=for-the-badge"></a>
   <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-2f80ed?style=for-the-badge">
+  <img alt="Target: AMD RDNA 3.5 / UMA" src="https://img.shields.io/badge/Target-AMD%20APU%20%2F%20UMA-1fb9d8?style=for-the-badge">
   <img alt="Direct3D 12, Shader Model 6.6" src="https://img.shields.io/badge/D3D12-SM%206.6-1fb9d8?style=for-the-badge">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable--msvc-1fb9d8?style=for-the-badge">
 </p>
 
 <p align="center">
+  <b><a href="#fork-focus-amd-apu--rog-xbox-ally-x">Fork focus</a></b> ·
   <b><a href="#games">Games</a></b> ·
   <b><a href="#highlights">Highlights</a></b> ·
   <b><a href="#how-it-works">How it works</a></b> ·
@@ -23,12 +25,44 @@
   <b><a href="#contributing">Contributing</a></b>
 </p>
 
-# XCL – Xbox Series X|S → Windows compatibility layer
+# XCL (AMD APU / Handheld Fork) – Xbox Series X|S → Windows compatibility layer
+
+> Experimental fork of [`xcl-dev/xcl`](https://github.com/xcl-dev/xcl) focused on **AMD APU / Unified Memory Architecture (UMA)** systems, **RDNA 3.5 (`Wave64`)** testing, and tighter memory budgets on Windows handhelds such as the **ASUS ROG Xbox Ally X** (AMD Ryzen AI Z2 Extreme, 24 GB shared LPDDR5X).
 
 XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a Windows PC - in the spirit of Wine/Proton. There is no CPU emulation: the game's x64 code runs natively, and XCL provides its own, independently written implementations of the console system libraries the PC does not have (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …). The console's GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
 > [!IMPORTANT]
 > XCL works only on unpacked game files you already own. It does not download, decrypt or unpack game packages (XVC / MSIXVC) and contains nothing for circumventing DRM. The repository holds no code, headers or binaries from the console SDK, no keys and no game data; the Windows components XCL relies on (XGameRuntime, XAudio2, D3D12, DXC) come from your own system or the public Windows SDK and are not distributed with XCL.
+>
+> **Fork clean-room rule:** This fork remains strictly **`GPL-2.0-only`**. No source code from `GPL-3.0` compatibility-layer projects may be copied into this repository; any new optimization or fix is designed and implemented from scratch.
+
+<p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
+
+## Fork focus: AMD APU & ROG Xbox Ally X
+
+Upstream XCL already targets AMD RDNA (`Wave64`) and D3D12 SM 6.6, and reaches ~5 fps in 3D scenes on high-end discrete GPUs (32 GB+ systems). Running on a **24 GB shared-memory handheld APU** introduces tighter memory, bandwidth and pipeline-compilation constraints.
+
+### Planned / active fork work
+
+- [ ] **Memory budget & Series S profile:** Reduce peak commit and VRAM arena pressure so titles targeting ~15–24 GB fit comfortably alongside Windows 11 on 24 GB UMA devices; support secondary `PresentX` UI/HUD plane composition where used.
+- [ ] **Mesh pipelines & 3D world stability:** Investigate and resolve remaining mesh pipeline / view-type refusals (e.g., missing world geometry / minimap pipelines) and long-run device/memory stability.
+- [ ] **UMA-aware D3D12.X paths:** Profile `d3d12x` buffer/heap aliasing, descriptor table pressure, and synchronization overhead on AMD `CacheCoherentUMA` / `UMA` adapters.
+- [ ] **Handheld PSO & DirectStorage tuning:** Offline/pre-run compute PSO precompilation (`--precompile --only cs --pipelines --used-only`) and tuned worker budgets (`XCL_DSTORAGE_WORKERS`, `XCL_HUGE_PSO_CONCURRENCY`) so background compilation does not stall low-TDP CPU cores or hit the 3 GB commit gate.
+- [ ] **RDNA 3.5 `Wave64` verification:** Run the full `wave64,mesh` GPU test suite natively on RDNA 3.5 drivers and track driver/DXC behavior.
+
+### Quick test profile for AMD APU / Ally X
+
+```powershell
+# Require native Wave64 + Mesh Shader GPU tests on the Radeon iGPU
+$env:XCL_ADAPTER = "radeon"
+$env:XCL_REQUIRE_GPU = "wave64,mesh"
+.\scripts\test.ps1
+
+# Optional runtime tuning for 24 GB shared-RAM handheld testing
+$env:XCL_DSTORAGE_PARALLEL_DECOMPRESS = "1"
+$env:XCL_DSTORAGE_WORKERS = "4"
+$env:XCL_DSTORAGE_MEMORY_BUDGET_MIB = "32"
+```
 
 <p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
 
@@ -203,7 +237,7 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
   `report.json` has it under `dxc`.
-- **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
+- **GPU:** upstream is developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
