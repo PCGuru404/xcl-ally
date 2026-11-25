@@ -3,7 +3,6 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/xcl"><img alt="Discord: join the server" src="https://img.shields.io/badge/Discord-join%20the%20server-7c5cff?style=for-the-badge"></a>
   <a href="https://github.com/xcl-dev/xcl"><img alt="Upstream: xcl-dev/xcl" src="https://img.shields.io/badge/upstream-xcl--dev%2Fxcl-2f80ed?style=for-the-badge"></a>
   <a href="LICENSE"><img alt="License: GPL-2.0-only" src="https://img.shields.io/badge/license-GPL--2.0--only-7c5cff?style=for-the-badge"></a>
   <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-2f80ed?style=for-the-badge">
@@ -329,8 +328,7 @@ part of the repository.
 ## Contributing
 
 Help is welcome – [`CONTRIBUTING.md`](CONTRIBUTING.md) has what a pull request needs, in short: small,
-one problem, tested. Test results on your GPU go to [#42](https://github.com/xcl-dev/xcl/issues/42),
-questions and talk to the [Discord server](https://discord.gg/xcl).
+one problem, tested. Test results on your GPU go to [#42](https://github.com/xcl-dev/xcl/issues/42).
 
 <p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
 
