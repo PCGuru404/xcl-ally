@@ -75,6 +75,44 @@ static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 // raw COM pointers of the title's objects; uploads hold a reference while they run
 unsafe impl Send for Entry {}
 
+#[derive(Clone, Copy)]
+struct SrcSpan {
+    start: usize,
+    end: usize,
+    max_end: usize,
+    res: usize,
+}
+
+fn build_src_tree(spans: &mut [SrcSpan]) -> usize {
+    if spans.is_empty() {
+        return 0;
+    }
+    let mid = spans.len() / 2;
+    let left_max = build_src_tree(&mut spans[..mid]);
+    let right_max = build_src_tree(&mut spans[mid + 1..]);
+    let m = spans[mid].end.max(left_max).max(right_max);
+    spans[mid].max_end = m;
+    m
+}
+
+fn query_src_tree(spans: &[SrcSpan], q_lo: usize, q_hi: usize, out: &mut Vec<usize>) {
+    if spans.is_empty() || q_lo >= q_hi {
+        return;
+    }
+    let mid = spans.len() / 2;
+    if spans[mid].max_end <= q_lo {
+        return;
+    }
+    query_src_tree(&spans[..mid], q_lo, q_hi, out);
+    let s = &spans[mid];
+    if s.start < q_hi && s.end > q_lo {
+        out.push(s.res);
+    }
+    if s.start < q_hi {
+        query_src_tree(&spans[mid + 1..], q_lo, q_hi, out);
+    }
+}
+
 struct Table {
     /// Active PC textures (newest at each range) → its place in the title's memory
     by_res: BTreeMap<usize, Entry>,
@@ -87,6 +125,9 @@ struct Table {
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
     next_seq: u64,
+    /// Flat sorted interval tree over active non-`gpu_written` `(src, src + size, res)` spans.
+    src_tree: Vec<SrcSpan>,
+    src_tree_dirty: bool,
 }
 
 impl Table {
@@ -98,7 +139,64 @@ impl Table {
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
+            src_tree: Vec::new(),
+            src_tree_dirty: false,
         }
+    }
+
+    fn ensure_src_tree(&mut self) {
+        if !self.src_tree_dirty {
+            return;
+        }
+        self.src_tree.clear();
+        self.src_tree.reserve(self.by_res.len());
+        for (&res, e) in &self.by_res {
+            if e.gpu_written {
+                continue;
+            }
+            let size = e.tex.size() as usize;
+            if size == 0 {
+                continue;
+            }
+            self.src_tree.push(SrcSpan {
+                start: e.src,
+                end: e.src.saturating_add(size),
+                max_end: 0,
+                res,
+            });
+        }
+        self.src_tree.sort_unstable_by_key(|s| (s.start, s.res));
+        build_src_tree(&mut self.src_tree);
+        self.src_tree_dirty = false;
+    }
+
+    fn collect_todo_keys(&mut self, dirty: &[usize], page: usize, include_pending: bool, out: &mut Vec<usize>) {
+        out.clear();
+        if include_pending {
+            for (&res, e) in &self.by_res {
+                if e.pending {
+                    out.push(res);
+                }
+            }
+        }
+        if !dirty.is_empty() && !self.by_res.is_empty() && page > 0 {
+            self.ensure_src_tree();
+            if !self.src_tree.is_empty() {
+                let mut i = 0;
+                while i < dirty.len() {
+                    let run_lo = dirty[i];
+                    let mut run_hi = run_lo.saturating_add(page);
+                    i += 1;
+                    while i < dirty.len() && dirty[i] <= run_hi {
+                        run_hi = run_hi.max(dirty[i].saturating_add(page));
+                        i += 1;
+                    }
+                    query_src_tree(&self.src_tree, run_lo, run_hi, out);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -167,6 +265,9 @@ impl Table {
         if self.shadowed.is_empty() {
             self.max_shadowed_size = 0;
         }
+        if retired > 0 {
+            self.src_tree_dirty = true;
+        }
         (pending_delta, retired, to_unmap)
     }
 
@@ -226,6 +327,7 @@ impl Table {
         }
         self.by_va.insert((va, res), end);
         self.by_res.insert(res, entry);
+        self.src_tree_dirty = true;
         (pending_delta, to_unmap)
     }
 
@@ -241,6 +343,7 @@ impl Table {
         }
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
         self.by_va.remove(&(old.va, res));
+        self.src_tree_dirty = true;
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
         let end = va.saturating_add(old.tex.size() as usize);
@@ -433,6 +536,9 @@ fn recheck_gpu_view_sources() {
     for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
         changed |= recheck_source(e);
     }
+    if changed {
+        t.src_tree_dirty = true;
+    }
     drop(g);
     if changed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
@@ -472,6 +578,7 @@ pub fn note_gpu_write(res: usize) {
                 e.gpu_written = true;
                 GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
                 marked = true;
+                t.src_tree_dirty = true;
             }
         }
     }
@@ -644,6 +751,8 @@ thread_local! {
     static WATCH_BUF: std::cell::RefCell<Vec<*mut c_void>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Reusable dirty page list for `refresh_once`.
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Reusable candidate resource key list for `refresh_once`.
+    static HITS_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
@@ -788,30 +897,27 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let include_pending = PENDING.load(Ordering::Relaxed) > 0;
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
-        let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
-                }
-                let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
-            })
-            .collect()
+        HITS_BUF.with(|hcell| {
+            let mut hits = hcell.borrow_mut();
+            let mut t = TEXTURES.lock().unwrap();
+            t.collect_todo_keys(&dirty, page as usize, include_pending, &mut hits);
+            hits.iter()
+                .filter_map(|&res| {
+                    let e = t.by_res.get_mut(&res)?;
+                    if e.pending {
+                        e.pending = false;
+                        PENDING.fetch_sub(1, Ordering::Relaxed);
+                    } else if e.gpu_written {
+                        return None;
+                    }
+                    let p = res as *mut c_void;
+                    ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                })
+                .collect()
+        })
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     upload_all(todo);
@@ -2427,5 +2533,130 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    #[test]
+    fn src_tree_matches_linear_scan_with_overlaps_and_giant_spans() {
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_64k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let tex_64m = Arc::new(xg::Texture::new(&console_desc(3, 4096, 4096, 1, 1, 28, 0x105)).unwrap());
+        let make_entry = |va: usize, src: usize, tex: &Arc<xg::Texture>, pending: bool, gpu_written: bool| Entry {
+            device: 0,
+            va,
+            src,
+            in_gpu_view: src != va,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending,
+            gpu_written,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+
+        let mut tbl = Table::new();
+        // Giant 64 MiB texture at the low end of src space (stress-tests max_end pruning).
+        tbl.insert(1, make_entry(0x1000_0000, 0x1000_0000, &tex_64m, false, false));
+        for i in 0..1500usize {
+            let va = 0x2000_0000 + i * 0x2_0000;
+            let src = if i % 10 == 0 { 0x8000_0000 + (i / 10) * 0x1_0000 } else { va };
+            let tex = if i % 3 == 0 { &tex_64k } else { &tex_16k };
+            let pending = i % 97 == 0;
+            let gpu_written = i % 13 == 0;
+            tbl.insert(100 + i, make_entry(va, src, tex, pending, gpu_written));
+        }
+        // Same-range format alias sharing `va` and `src`.
+        tbl.insert(9999, make_entry(0x2000_0000, 0x8000_0000, &tex_64k, false, false));
+
+        let page = 0x1000usize;
+        let test_dirty_sets: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![0x1500_0000], // gap between giant texture and 0x2000_0000
+            vec![0x1000_2000, 0x2000_1000, 0x2000_2000, 0x2000_3000, 0x8002_3000],
+            (0..200).map(|k| 0x2100_0000 + k * 0x3000).collect(),
+            (0..128).map(|k| 0x2200_0000 + k * page).collect(),
+        ];
+
+        let mut hits = Vec::new();
+        for dirty in &test_dirty_sets {
+            for include_pending in [false, true] {
+                let mut expected: Vec<usize> = tbl
+                    .by_res
+                    .iter()
+                    .filter(|(_, e)| {
+                        if include_pending && e.pending {
+                            return true;
+                        }
+                        if e.gpu_written {
+                            return false;
+                        }
+                        let i = dirty.partition_point(|&p| p + page <= e.src);
+                        dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                    })
+                    .map(|(&res, _)| res)
+                    .collect();
+                expected.sort_unstable();
+
+                tbl.collect_todo_keys(dirty, page, include_pending, &mut hits);
+                assert_eq!(hits, expected, "mismatch for dirty len {} include_pending={include_pending}", dirty.len());
+            }
+        }
+    }
+
+    #[test]
+    fn src_tree_bench_4000_textures_sparse_dirty() {
+        let tex_64k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let mut tbl = Table::new();
+        for i in 0..4000usize {
+            let va = 0x1_0000_0000 + i * 0x2_0000;
+            tbl.insert(
+                i + 1,
+                Entry {
+                    device: 0,
+                    va,
+                    src: va,
+                    in_gpu_view: false,
+                    tex: Arc::clone(&tex_64k),
+                    states: vec![D3D12_RESOURCE_STATE_COMMON],
+                    pending: false,
+                    gpu_written: false,
+                    placed: false,
+                    unmapped: false,
+                    seq: 0,
+                },
+            );
+        }
+        let page = 0x1000usize;
+        // 32 scattered dirty pages in gaps between textures (non-texture CPU writes)
+        let dirty: Vec<usize> = (0..32).map(|k| 0x1_0001_2000 + k * 0x8_0000).collect();
+
+        let t_linear = std::time::Instant::now();
+        let mut linear_hits = 0usize;
+        for _ in 0..500 {
+            for (&res, e) in &tbl.by_res {
+                let i = dirty.partition_point(|&p| p + page <= e.src);
+                if dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize) {
+                    linear_hits += res;
+                }
+            }
+        }
+        let linear_dur = t_linear.elapsed();
+
+        tbl.ensure_src_tree();
+        let mut hits = Vec::new();
+        let t_tree = std::time::Instant::now();
+        for _ in 0..500 {
+            tbl.collect_todo_keys(&dirty, page, false, &mut hits);
+            assert!(hits.is_empty());
+        }
+        let tree_dur = t_tree.elapsed();
+
+        assert_eq!(linear_hits, 0);
+        eprintln!(
+            "title_textures 4000x500 non-texture dirty lookup: linear={:?}, src_tree={:?} (speedup: {:.1}x)",
+            linear_dur,
+            tree_dur,
+            linear_dur.as_secs_f64() / tree_dur.as_secs_f64().max(1e-9)
+        );
     }
 }
